@@ -17,16 +17,6 @@ raw.reg.register_handler("NPY_SEQ", NumpySeqHandler)
 processed.reg.register_handler("NPY_SEQ", NumpySeqHandler)
 raw.prepare_hook = lambda name, doc: copy.deepcopy(doc)
 
-# ACQUISITION
-
-from bluesky import RunEngine
-from ophyd.sim import img, motor
-from bluesky.plans import scan
-
-RE = RunEngine({})
-RE.subscribe(raw.insert)
-uid, = RE(scan([img], motor, -1, 1, 3))
-
 # PROCESSING
 
 from event_model import compose_run
@@ -125,7 +115,32 @@ class Processor:
         return self.compose_run_bundle.compose_stop()
 
 
-def process(uid):
+from bluesky.callbacks import CallbackBase
+
+class LiveProcessor(CallbackBase):
+    def __init__(self, factor):
+        self.factor = factor
+
+    def __call__(self, name, doc):
+        if name == 'start':
+            return self.start(doc)
+        if not self.applicable:
+            return
+        _, filled_doc = self.filler(name, doc)
+        _, processed_doc = self.processor(name, filled_doc)
+        print(processed_doc)
+        processed_doc.pop('id', None)
+        processed.insert(name, processed_doc)
+
+    def start(self, doc):
+        self.filler = Filler({"NPY_SEQ": NumpySeqHandler})
+        self.applicable = is_applicable(doc)
+        self.processor = Processor(factor=self.factor)
+        _, processed_doc = self.processor('start', doc)
+        processed.insert('start', processed_doc)
+
+
+def process(uid, factor=1):
     print('processing', uid)
     gen = raw[uid].documents()
     # Pull off the first document, check that it is a 'start' document. (If it
@@ -136,7 +151,7 @@ def process(uid):
     if not is_applicable(start_doc):
         logger.info("Run %r is not applicable.", uid)
         return
-    processor = Processor(factor=3)
+    processor = Processor(factor=factor)
     # Push the start_doc through.
     _, processed_doc = processor('start', start_doc)
     processed.insert('start', processed_doc)
@@ -149,14 +164,28 @@ def process(uid):
         processed_doc.pop('id', None)
         processed.insert(name, processed_doc)
 
-# RE-INSERT
+# ACQUISITION WITH LIVE PROCESSING
 
-print('about to process')
-process(uid)
+from bluesky import RunEngine
+from ophyd.sim import img, motor
+from bluesky.plans import scan
+
+RE = RunEngine({})
+RE.subscribe(raw.insert)
+RE.subscribe(LiveProcessor(factor=1))
+RE.subscribe(LiveProcessor(factor=3))
+
+uid, = RE(scan([img], motor, -1, 1, 3))
+
+# RE-PROCESSING
+
+process(uid, factor=10)
+process(uid, factor=100)
 
 # ACCESS
 
 raw_header = raw[uid]  # db[uid]
+
 processed_headers = processed(raw_uid=uid)
-processed_header, = processed_headers  # assume just one for now
-print(processed_header.table())
+for processed_header in processed_headers:
+    print(processed_header.table())
