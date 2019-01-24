@@ -54,7 +54,7 @@ class Processor(DocumentRouter):
 
     def descriptor(self, doc):
         name = 'primary'
-        data_keys = {'sum': {'shape': [], 'dtype': 'number'}}
+        data_keys = {'sum': {'shape': [], 'dtype': 'number', 'source': repr(self)}}
         self.compose_descriptor_bundle = self.compose_run_bundle.compose_descriptor(
                 name=name, data_keys=data_keys,
                 object_names=None, configuration={}, hints=None)
