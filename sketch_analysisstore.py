@@ -19,7 +19,7 @@ raw.prepare_hook = lambda name, doc: copy.deepcopy(doc)
 
 # PROCESSING
 
-from event_model import compose_run
+from event_model import Filler, compose_run, DocumentRouter
 
 def is_applicable(start_doc):
     ...
@@ -30,49 +30,7 @@ def is_applicable(start_doc):
 def my_analysis_function(arr, factor):
     return factor * numpy.sum(arr)
 
-class Filler:
-    def __init__(self, handler_registry):
-        self.handler_registry = handler_registry
-        self.handlers = {}
-        self.datums = {}
-
-    def __call__(self, name, doc):
-        return name, getattr(self, name)(doc)
-
-    def start(self, doc):
-        return doc
-
-    def resource(self, doc):
-        handler_class = self.handler_registry[doc['spec']]
-        handler = handler_class(doc['resource_path'],
-                                root=doc['root'],
-                                **doc['resource_kwargs'])
-        self.handlers[doc['uid']] = handler
-        return doc
-
-    def datum(self, doc):
-        self.datums[doc['datum_id']] = doc
-        return doc
-
-    def event(self, doc):
-        for key, is_filled in doc['filled'].items():
-            if not is_filled:
-                datum_id = doc['data'][key]
-                datum_doc = self.datums[datum_id]
-                handler = self.handlers[datum_doc['resource']]
-                actual_data = handler(**datum_doc['datum_kwargs'])
-                doc['data'][key] = actual_data
-                doc['filled'][key] = True
-        return doc
-
-    def descriptor(self, doc):
-        return doc
-
-    def stop(self, doc):
-        return doc
-
-
-class Processor:
+class Processor(DocumentRouter):
     version = 1
     
     def __init__(self, factor):
