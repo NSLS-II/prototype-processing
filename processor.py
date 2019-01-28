@@ -3,6 +3,7 @@ import copy
 from collections import namedtuple
 import numpy
 import logging
+import pandas as pd
 
 logger = logging.getLogger('iss_processor')
 
@@ -15,6 +16,7 @@ processed = Broker.named('temp')  # makes a second, unique temporary Broker
 
 import sys
 import xas.interpolate
+import xas.xray
 from event_model import Filler, compose_run, DocumentRouter, pack_event_page, verify_filled
 from bluesky.callbacks.zmq import RemoteDispatcher, Publisher
 
@@ -23,54 +25,35 @@ publisher = Publisher('localhost:5577', prefix=b'interpolated')
 
 # HANDLERS COPIED FROM PROFILE -- MOVE THESE TO CENTRAL PLACE!!
 
-class PizzaBoxEncHandlerTxt:
-    encoder_row = namedtuple('encoder_row',
-                             ['ts_s', 'ts_ns', 'encoder', 'index', 'state'])
+# New handlers to support reading files into a Pandas dataframe
+class PizzaBoxAnHandlerTxtPD:
     "Read PizzaBox text files using info from filestore."
-    def __init__(self, fpath, chunk_size):
-        self.chunk_size = chunk_size
-        with open(fpath, 'r') as f:
-            self.lines = list(f)
+    def __init__(self, fpath):
+        self.df = pd.read_table(fpath, names=['ts_s', 'ts_ns', 'index', 'adc'], sep=' ')
 
-    def __call__(self, chunk_num):
-        cs = self.chunk_size
-        return [self.encoder_row(*(int(v) for v in ln.split()))
-                for ln in self.lines[chunk_num*cs:(chunk_num+1)*cs]]
+    def __call__(self):
+        return self.df
 
-
-class PizzaBoxDIHandlerTxt:
-    di_row = namedtuple('di_row', ['ts_s', 'ts_ns', 'encoder', 'index', 'di'])
+class PizzaBoxDIHandlerTxtPD:
     "Read PizzaBox text files using info from filestore."
-    def __init__(self, fpath, chunk_size):
-        self.chunk_size = chunk_size
-        with open(fpath, 'r') as f:
-            self.lines = list(f)
+    def __init__(self, fpath):
+        self.df = pd.read_table(fpath, names=['ts_s', 'ts_ns', 'encoder', 'index', 'di'], sep=' ')
 
-    def __call__(self, chunk_num):
-        cs = self.chunk_size
-        return [self.di_row(*(int(v) for v in ln.split()))
-                for ln in self.lines[chunk_num*cs:(chunk_num+1)*cs]]
+    def __call__(self):
+        return self.df
 
-
-class PizzaBoxAnHandlerTxt:
-    encoder_row = namedtuple('encoder_row', ['ts_s', 'ts_ns', 'index', 'adc'])
+class PizzaBoxEncHandlerTxtPD:
     "Read PizzaBox text files using info from filestore."
+    def __init__(self, fpath):
+        self.df = pd.read_table(fpath, names=['ts_s', 'ts_ns', 'encoder', 'index', 'state'], sep=' ')
 
-    bases = (10, 10, 10, 16)
-    def __init__(self, fpath, chunk_size):
-        self.chunk_size = chunk_size
-        with open(fpath, 'r') as f:
-            self.lines = list(f)
+    def __call__(self):
+        return self.df
 
-    def __call__(self, chunk_num):
 
-        cs = self.chunk_size
-        return [self.encoder_row(*(int(v, base=b) for v, b in zip(ln.split(), self.bases)))
-                for ln in self.lines[chunk_num*cs:(chunk_num+1)*cs]]
-
-handler_registry = {'PIZZABOX_AN_FILE_TXT': PizzaBoxAnHandlerTxt,
-                    'PIZZABOX_ENC_FILE_TXT': PizzaBoxEncHandlerTxt,
-                    'PIZZABOX_DI_FILE_TXT': PizzaBoxDIHandlerTxt}
+handler_registry = {'PIZZABOX_AN_FILE_TXT_PD': PizzaBoxAnHandlerTxtPD,
+                    'PIZZABOX_ENC_FILE_TXT_PD': PizzaBoxEncHandlerTxtPD,
+                    'PIZZABOX_DI_FILE_TXT_PD': PizzaBoxDIHandlerTxtPD}
 
 def is_applicable(start_doc):
     ...
@@ -84,12 +67,19 @@ def my_analysis_function(arr, factor):
 
 class Interpolator(Filler):
     version = xas.__version__
-    
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_doc = None
+        self.descriptor_doc = None
+        self.dataset_for_interp = {}
+
     def __call__(self, name, doc):
         _, processed_doc = super().__call__(name, doc)
 
     def start(self, doc):
         doc = super().start(doc)
+        self.start_doc = doc
         metadata = {'raw_uid': doc['uid'],
                     'processor_version': self.version,
                     'processor_parameters': {}}
@@ -98,6 +88,7 @@ class Interpolator(Filler):
 
     def descriptor(self, doc):
         doc = super().descriptor(doc)
+        self.descriptor_doc = doc
         name = 'primary'
         data_keys = {'sum': {'shape': [], 'dtype': 'number', 'source': repr(self)}}
         self.compose_descriptor_bundle = self.compose_run_bundle.compose_descriptor(
@@ -108,18 +99,63 @@ class Interpolator(Filler):
     def event_page(self, doc):
         doc = super().event_page(doc)
         verify_filled(doc)
-        key, = doc['data']
-        print('event_page doc', doc)
-        result = [xas.interpolate.interpolate(dataframe) for dataframe in doc['data'][key]]
+        stream_name, = doc['data']
+        dev_name = self.descriptor_doc['data_keys'][stream_name]['devname']
+
+        raw_data, = doc['data'][stream_name]
+
+        def load_adc_trace(df_raw):
+            df = pd.DataFrame()
+            df['timestamp'] = df_raw['ts_s'] + 1e-9 * df_raw['ts_ns']
+            df['adc'] = df_raw['adc'].apply(lambda x: (int(x, 16) >> 8) - 0x40000 if (int(x, 16) >> 8) > 0x1FFFF else int(x, 16) >> 8) * 7.62939453125e-05
+            return df
+
+        def load_enc_trace(df_raw):
+            df = pd.DataFrame()
+            df['timestamp'] = df_raw['ts_s'] + 1e-9 * df_raw['ts_ns']
+            df['encoder'] = df_raw['encoder'].apply(lambda x: int(x) if int(x) <= 0 else -(int(x) ^ 0xffffff - 1))
+            return df
+
+        def load_trig_trace(df):
+            df['timestamp'] = df['ts_s'] + 1e-9 * df['ts_ns']
+            df = df.iloc[::2]
+            return df.iloc[:, [5, 3]]
+
+        data = pd.DataFrame()
+        stream_source = self.descriptor_doc['data_keys'][stream_name]['source']
+
+        if stream_source == 'pizzabox-di-file':
+            data = load_trig_trace(raw_data)
+
+        if stream_source == 'pizzabox-adc-file':
+            data = load_adc_trace(raw_data)
+            stream_offset = f'{stream_name} offset'
+            if stream_offset in self.start_doc:
+                data.iloc[:, 1] -= self.start_doc[stream_offset]
+            stream_gain = f'{stream_name} gain'
+            if stream_gain in self.start_doc:
+                data.iloc[:, 1] /= 10**self.start_doc[stream_gain]
+
+        if stream_source == 'pizzabox-enc-file':
+            data = load_enc_trace(raw_data)
+            if dev_name == 'hhm_theta':
+                data.iloc[:, 1] = xas.xray.encoder2energy(data['encoder'], 360000, -float(self.start_doc['angle_offset']))
+                dev_name = 'energy'
+
         event_page = self.compose_descriptor_bundle.compose_event_page(
-            data={'sum': result},
-            timestamps={'sum': [time.time()] * len(result)},
+            data={'sum': data},
+            timestamps={'sum': [time.time()] * len(data)},
             seq_num=doc['seq_num'],
             validate=False)  # FIXME
+
+        self.dataset_for_interp[dev_name] = data
         return event_page
 
     def stop(self, doc):
         doc = super().stop(doc)
+        # result = [xas.interpolate.interpolate(dataframe) for dataframe in doc['data'][key]]
+        # TODO: perform interpolation
+        result = xas.interpolate.interpolate(self.dataset_for_interp)
         return self.compose_run_bundle.compose_stop()
 
 
