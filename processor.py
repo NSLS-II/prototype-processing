@@ -72,10 +72,27 @@ class Interpolator(Filler):
         super().__init__(*args, **kwargs)
         self.start_doc = None
         self.descriptor_doc = None
-        self.dataset_for_interp = {}
+        self._preprocessed_data = {}
 
     def __call__(self, name, doc):
         _, processed_doc = super().__call__(name, doc)
+
+        if name == 'stop':
+            interpolated_data = xas.interpolate.interpolate(self._preprocessed_data)
+            self._preprocessed_data = {}
+            event_page = self.compose_descriptor_bundle.compose_event_page(
+                 data={'interpolated_data': interpolated_data},
+                 timestamps={'interpolated_data': [time.time()] * len(interpolated_data)},
+                 seq_num=doc['seq_num'],
+                 validate=False)  # FIXME
+            return event_page
+
+        elif name == 'event_page':
+            ...
+
+        else:
+            processed.insert(name, processed_doc)  # send result to "processed databroker"
+            publisher(name, processed_doc)  # send result back to GUI via 0MQ, where it will kick off the next analysis steps
 
     def start(self, doc):
         doc = super().start(doc)
@@ -90,7 +107,7 @@ class Interpolator(Filler):
         doc = super().descriptor(doc)
         self.descriptor_doc = doc
         name = 'primary'
-        data_keys = {'sum': {'shape': [], 'dtype': 'number', 'source': repr(self)}}
+        data_keys = {'interpolated_data': {'shape': [], 'dtype': 'number', 'source': repr(self)}}
         self.compose_descriptor_bundle = self.compose_run_bundle.compose_descriptor(
                 name=name, data_keys=data_keys,
                 object_names=None, configuration={}, hints=None)
@@ -142,21 +159,7 @@ class Interpolator(Filler):
                 data.iloc[:, 1] = xas.xray.encoder2energy(data['encoder'], 360000, -float(self.start_doc['angle_offset']))
                 dev_name = 'energy'
 
-        event_page = self.compose_descriptor_bundle.compose_event_page(
-            data={'sum': data},
-            timestamps={'sum': [time.time()] * len(data)},
-            seq_num=doc['seq_num'],
-            validate=False)  # FIXME
-
-        self.dataset_for_interp[dev_name] = data
-        return event_page
-
-    def stop(self, doc):
-        doc = super().stop(doc)
-        # result = [xas.interpolate.interpolate(dataframe) for dataframe in doc['data'][key]]
-        # TODO: perform interpolation
-        result = xas.interpolate.interpolate(self.dataset_for_interp)
-        return self.compose_run_bundle.compose_stop()
+        self._preprocessed_data[dev_name] = data
 
 
 dispatcher = RemoteDispatcher('localhost:5578', prefix=b'raw')
